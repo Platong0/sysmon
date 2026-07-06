@@ -46,6 +46,8 @@ DEFAULTS = {
     "font_size": 14,
     "x": None,
     "y": None,
+    "mode": "list",   # "list" — простой столбик; "board" — мозаика из плиток
+    "layout": {},     # позиции плиток в режиме board: {key: [x, y]}
 }
 
 
@@ -74,11 +76,15 @@ def load_config():
             DEFAULT_METRICS
         )
 
-    for k in ("metrics", "opacity", "font_size", "x", "y"):
+    for k in ("metrics", "opacity", "font_size", "x", "y", "mode", "layout"):
         if k in raw:
             cfg[k] = raw[k]
     if isinstance(raw.get("colors"), dict):
         cfg["colors"].update({k: v for k, v in raw["colors"].items() if k in KEYS})
+    if not isinstance(cfg.get("layout"), dict):
+        cfg["layout"] = {}
+    if cfg.get("mode") not in ("list", "board"):
+        cfg["mode"] = "list"
 
     cfg["metrics"] = [k for k in cfg["metrics"] if k in KEYS] or list(DEFAULT_METRICS)
     return cfg
@@ -92,6 +98,8 @@ def save_config(cfg):
         "font_size": cfg["font_size"],
         "x": cfg["x"],
         "y": cfg["y"],
+        "mode": cfg.get("mode", "list"),
+        "layout": cfg.get("layout", {}),
     }
     try:
         with open(CONFIG_PATH, "w", encoding="utf-8") as f:

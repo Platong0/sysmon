@@ -2,13 +2,16 @@
 """
 sysmon — плавающий настраиваемый оверлей для macOS.
 
-Каждая метрика — отдельный цветной блок. Набор, порядок и цвета блоков
-настраиваются. Общая логика метрик — в metrics.py.
+Два режима:
+  • «Список» — блоки сами встают в столбик (просто, ничего не таскать).
+  • «Мозаика» — плитки можно перетаскивать мышкой, они магнитно прилипают
+    краями друг к другу (как LEGO). Раскладка сохраняется.
 
 Управление:
-  - перетаскивай окошко мышкой за любое место;
-  - правый клик по окошку — меню (Настройки…, прозрачность, выход);
-  - в окне настроек: галочка — показывать, ▲▼ — порядок, слева цвет блока.
+  • тащи плитку — двигаешь плитку (в режиме «Мозаика»); тащи пустое место —
+    двигаешь всё окно;
+  • правый клик — меню (режим, настройки, прозрачность, выход).
+Общая логика метрик — в metrics.py.
 """
 
 import time
@@ -24,6 +27,7 @@ from AppKit import (
     NSButton,
     NSButtonTypeSwitch,
     NSColor,
+    NSEvent,
     NSFont,
     NSFontAttributeName,
     NSForegroundColorAttributeName,
@@ -65,21 +69,22 @@ def ns_color(hexstr, alpha=1.0):
     return NSColor.colorWithCalibratedRed_green_blue_alpha_(r, g, b, alpha)
 
 
-# -------------------------------------------------------------------- оверлей
-# геометрия блоков
+# геометрия плиток
 OUT = 8      # внешний отступ окна
-GAP = 6      # промежуток между блоками
+GAP = 6      # промежуток между плитками (в режиме «Список» и при авто-раскладке)
 PADH = 10    # горизонтальный внутренний отступ
 PADV = 6     # вертикальный внутренний отступ
 BAR = 4      # ширина цветной полоски слева
 BARGAP = 9   # отступ от полоски до текста
+SNAP = 16    # порог магнитного прилипания, пикселей
 
 
+# -------------------------------------------------------------------- оверлей
 class OverlayView(NSView):
     def initWithController_(self, controller):
         self = self.initWithFrame_(NSMakeRect(0, 0, 200, 100))
         self.controller = controller
-        self.items = []  # [{x,y,w,h, color:(r,g,b), lines:[...]}]
+        self.items = []  # [{key,x,y,w,h, color:(r,g,b), lines:[...]}]
         return self
 
     def isFlipped(self):
@@ -122,8 +127,16 @@ class OverlayView(NSView):
         self.items = items
         self.setNeedsDisplay_(True)
 
-    def mouseDownCanMoveWindow(self):
-        return True
+    # --- мышь: перетаскивание плиток / окна ---
+    def mouseDown_(self, event):
+        p = self.convertPoint_fromView_(event.locationInWindow(), None)
+        self.controller.onMouseDown_at_(p.x, p.y)
+
+    def mouseDragged_(self, event):
+        self.controller.onMouseDragged()
+
+    def mouseUp_(self, event):
+        self.controller.onMouseUp()
 
     def rightMouseDown_(self, event):
         self.controller.popUpMenu_(event)
@@ -145,6 +158,12 @@ class Monitor(NSObject):
         self._fps = 0.0
         self._last_fps_t = time.monotonic()
         self._settings_win = None
+        self._last_blocks = []
+        self._tile_boxes = {}     # {key: (lx, ly, w, h)} в координатах холста (board)
+        self._board_left = None   # экранная X левого края окна (board)
+        self._board_top = None    # экранная Y верхнего края окна (board, ось вверх)
+        self._prev_off = (OUT, OUT)
+        self._drag = None
         self._build_window()
         self._start_timers()
         return self
@@ -172,7 +191,6 @@ class Monitor(NSObject):
             NSWindowCollectionBehaviorCanJoinAllSpaces
             | NSWindowCollectionBehaviorStationary
         )
-        win.setMovableByWindowBackground_(True)
         win.setHasShadow_(False)
         win.setAlphaValue_(self.cfg["opacity"])
 
@@ -216,12 +234,20 @@ class Monitor(NSObject):
                 blocks.append((key, chunk))
         if not blocks:
             blocks = [("clock", ["правый клик →", "Настройки"])]
-
-        items = self._layout(blocks)
-        self.view.setItems_(items)
+        self._last_blocks = blocks
+        self._render()
 
     @objc.python_method
-    def _layout(self, blocks):
+    def _render(self):
+        if self.cfg.get("mode") == "board":
+            items = self._layout_board(self._last_blocks)
+        else:
+            items = self._layout_list(self._last_blocks)
+        self.view.setItems_(items)
+
+    # ---------- геометрия плитки ----------
+    @objc.python_method
+    def _tile_sizes(self, blocks):
         fs = self.cfg["font_size"]
         font = NSFont.monospacedSystemFontOfSize_weight_(fs, 0.0)
         attrs = {NSFontAttributeName: font}
@@ -230,37 +256,176 @@ class Monitor(NSObject):
         def text_w(s):
             return NSString.stringWithString_(s).sizeWithAttributes_(attrs).width
 
-        content_w = 0
-        for _, lines in blocks:
-            for ln in lines:
-                content_w = max(content_w, text_w(ln))
-        block_w = PADH + BAR + BARGAP + int(content_w) + PADH
+        sizes = {}
+        for key, lines in blocks:
+            cw = max((text_w(ln) for ln in lines), default=40)
+            w = PADH + BAR + BARGAP + int(cw) + PADH
+            h = PADV * 2 + len(lines) * line_h
+            sizes[key] = (w, h)
+        return sizes
+
+    # ---------- режим «Список» ----------
+    @objc.python_method
+    def _layout_list(self, blocks):
+        sizes = self._tile_sizes(blocks)
+        block_w = max((sizes[k][0] for k, _ in blocks), default=150)
 
         items = []
         y = OUT
         for key, lines in blocks:
-            h = PADV * 2 + len(lines) * line_h
-            items.append(
-                {
-                    "x": OUT,
-                    "y": y,
-                    "w": block_w,
-                    "h": h,
-                    "color": hex_to_rgb(self.cfg["colors"].get(key, "#FFFFFF")),
-                    "lines": lines,
-                }
-            )
+            h = sizes[key][1]
+            items.append({
+                "key": key, "x": OUT, "y": y, "w": block_w, "h": h,
+                "color": hex_to_rgb(self.cfg["colors"].get(key, "#FFFFFF")),
+                "lines": lines,
+            })
             y += h + GAP
 
         win_w = OUT * 2 + block_w
         win_h = y - GAP + OUT
-
         old = self.window.frame()
         top = old.origin.y + old.size.height
         self.window.setFrame_display_(
             NSMakeRect(old.origin.x, top - win_h, win_w, win_h), True
         )
         return items
+
+    # ---------- режим «Мозаика» ----------
+    @objc.python_method
+    def _layout_board(self, blocks):
+        sizes = self._tile_sizes(blocks)
+        layout = self.cfg["layout"]
+        shown = [k for k, _ in blocks]
+
+        # авто-позиции для плиток без сохранённой позиции — столбиком
+        placed = [k for k in shown if k in layout]
+        next_y = 0
+        if placed:
+            next_y = max(layout[k][1] + sizes[k][1] for k in placed) + GAP
+        for key in shown:
+            if key not in layout:
+                layout[key] = [0, next_y]
+                next_y += sizes[key][1] + GAP
+
+        xs = [layout[k][0] for k in shown]
+        ys = [layout[k][1] for k in shown]
+        minx, miny = min(xs), min(ys)
+        rights = [layout[k][0] + sizes[k][0] for k in shown]
+        bottoms = [layout[k][1] + sizes[k][1] for k in shown]
+
+        off = (-minx + OUT, -miny + OUT)
+        win_w = (max(rights) - minx) + 2 * OUT
+        win_h = (max(bottoms) - miny) + 2 * OUT
+
+        if self._board_left is None:
+            fr = self.window.frame()
+            self._board_left = fr.origin.x
+            self._board_top = fr.origin.y + fr.size.height
+            self._prev_off = off
+
+        # компенсируем сдвиг холста, чтобы неподвижные плитки не «прыгали»
+        dox = off[0] - self._prev_off[0]
+        doy = off[1] - self._prev_off[1]
+        self._board_left -= dox
+        self._board_top += doy
+        self._prev_off = off
+
+        self.window.setFrame_display_(
+            NSMakeRect(self._board_left, self._board_top - win_h, win_w, win_h), True
+        )
+
+        items = []
+        boxes = {}
+        for key, lines in blocks:
+            lx, ly = layout[key]
+            w, h = sizes[key]
+            boxes[key] = (lx, ly, w, h)
+            items.append({
+                "key": key, "x": lx + off[0], "y": ly + off[1], "w": w, "h": h,
+                "color": hex_to_rgb(self.cfg["colors"].get(key, "#FFFFFF")),
+                "lines": lines,
+            })
+        self._tile_boxes = boxes
+        return items
+
+    # ---------- перетаскивание ----------
+    @objc.python_method
+    def onMouseDown_at_(self, px, py):
+        loc = NSEvent.mouseLocation()
+        key = None
+        if self.cfg.get("mode") == "board":
+            for it in reversed(self.view.items):
+                if it["x"] <= px <= it["x"] + it["w"] and it["y"] <= py <= it["y"] + it["h"]:
+                    key = it["key"]
+                    break
+        if key is not None:
+            self._drag = {"type": "tile", "key": key, "lx": loc.x, "ly": loc.y}
+        else:
+            self._drag = {"type": "win", "lx": loc.x, "ly": loc.y}
+
+    @objc.python_method
+    def onMouseDragged(self):
+        if not self._drag:
+            return
+        loc = NSEvent.mouseLocation()
+        dx = loc.x - self._drag["lx"]
+        dy = loc.y - self._drag["ly"]
+        self._drag["lx"] = loc.x
+        self._drag["ly"] = loc.y
+
+        if self._drag["type"] == "win":
+            o = self.window.frame().origin
+            self.window.setFrameOrigin_(NSMakePoint(o.x + dx, o.y + dy))
+            if self.cfg.get("mode") == "board" and self._board_left is not None:
+                self._board_left += dx
+                self._board_top += dy
+        else:
+            key = self._drag["key"]
+            pos = self.cfg["layout"].get(key)
+            if pos:
+                pos[0] += dx      # экран X == холст X
+                pos[1] += -dy     # экран Y вверх, холст Y вниз
+                self._render()
+
+    @objc.python_method
+    def onMouseUp(self):
+        if not self._drag:
+            return
+        if self._drag["type"] == "tile":
+            self._snap(self._drag["key"])
+            self._render()
+        else:
+            o = self.window.frame().origin
+            self.cfg["x"] = int(o.x)
+            self.cfg["y"] = int(o.y)
+        save_config(self.cfg)
+        self._drag = None
+
+    @objc.python_method
+    def _snap(self, key):
+        """Магнитное прилипание: двигаем плитку к краям соседей."""
+        boxes = self._tile_boxes
+        if key not in boxes:
+            return
+        lx, ly, w, h = boxes[key]
+        others = [(k, b) for k, b in boxes.items() if k != key]
+        if not others:
+            return
+
+        # кандидаты по X: выровнять края или встать вплотную слева/справа
+        cand_x, cand_y = [], []
+        for _, (ox, oy, ow, oh) in others:
+            cand_x += [ox, ox + ow - w, ox + ow, ox - w]
+            cand_y += [oy, oy + oh - h, oy + oh, oy - h]
+
+        best = min(cand_x, key=lambda c: abs(c - lx))
+        if abs(best - lx) <= SNAP:
+            lx = best
+        best = min(cand_y, key=lambda c: abs(c - ly))
+        if abs(best - ly) <= SNAP:
+            ly = best
+
+        self.cfg["layout"][key] = [lx, ly]
 
     # --------------------------------------------------------------- меню
     @objc.python_method
@@ -272,13 +437,24 @@ class Monitor(NSObject):
             item.setTarget_(self)
             menu.addItem_(item)
 
-        add("Настройки…", b"openSettings:")
+        if self.cfg.get("mode") == "board":
+            add("Режим: Мозаика ✓  →  Список", b"toggleMode:")
+        else:
+            add("Режим: Список ✓  →  Мозаика", b"toggleMode:")
         menu.addItem_(NSMenuItem.separatorItem())
+        add("Настройки…", b"openSettings:")
         add("Прозрачнее", b"lessOpaque:")
         add("Плотнее", b"moreOpaque:")
         menu.addItem_(NSMenuItem.separatorItem())
         add("Выход", b"quit:")
         NSMenu.popUpContextMenu_withEvent_forView_(menu, event, self.view)
+
+    def toggleMode_(self, sender):
+        self.cfg["mode"] = "list" if self.cfg.get("mode") == "board" else "board"
+        self._board_left = None  # переинициализировать привязку окна
+        self._prev_off = (OUT, OUT)
+        save_config(self.cfg)
+        self._render()
 
     def lessOpaque_(self, sender):
         self.cfg["opacity"] = max(0.2, round(self.cfg["opacity"] - 0.1, 2))
@@ -291,15 +467,11 @@ class Monitor(NSObject):
         save_config(self.cfg)
 
     def quit_(self, sender):
-        self._save_position()
-        NSApp().terminate_(self)
-
-    @objc.python_method
-    def _save_position(self):
-        frame = self.window.frame()
-        self.cfg["x"] = int(frame.origin.x)
-        self.cfg["y"] = int(frame.origin.y)
+        o = self.window.frame().origin
+        self.cfg["x"] = int(o.x)
+        self.cfg["y"] = int(o.y)
         save_config(self.cfg)
+        NSApp().terminate_(self)
 
     # ------------------------------------------------------------ настройки
     def openSettings_(self, sender):
@@ -396,6 +568,7 @@ class Monitor(NSObject):
             metrics.append(key)
         save_config(self.cfg)
         self._rebuild_settings_view()
+        self._render()
 
     def moveUp_(self, sender):
         self._move(KEYS[sender.tag()], -1)
@@ -414,6 +587,7 @@ class Monitor(NSObject):
             metrics[i], metrics[j] = metrics[j], metrics[i]
             save_config(self.cfg)
             self._rebuild_settings_view()
+            self._render()
 
 
 def main():
