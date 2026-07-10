@@ -15,6 +15,7 @@ sysmon — плавающий настраиваемый оверлей для m
 """
 
 import time
+from collections import deque
 
 import objc
 
@@ -35,7 +36,9 @@ from AppKit import (
     NSMenuItem,
     NSScreen,
     NSScreenSaverWindowLevel,
+    NSStatusBar,
     NSTextField,
+    NSVariableStatusItemLength,
     NSView,
     NSWindow,
     NSWindowCollectionBehaviorCanJoinAllSpaces,
@@ -62,6 +65,7 @@ from metrics import (
     load_config,
     save_config,
 )
+from editor_mac import Editor
 
 
 def ns_color(hexstr, alpha=1.0):
@@ -157,16 +161,46 @@ class Monitor(NSObject):
         self._frame_count = 0
         self._fps = 0.0
         self._last_fps_t = time.monotonic()
-        self._settings_win = None
+        self._editor = None
         self._last_blocks = []
+        self.history = {k: deque(maxlen=120) for k in KEYS}  # история значений для графиков
         self._tile_boxes = {}     # {key: (lx, ly, w, h)} в координатах холста (board)
         self._board_left = None   # экранная X левого края окна (board)
         self._board_top = None    # экранная Y верхнего края окна (board, ось вверх)
         self._prev_off = (OUT, OUT)
         self._drag = None
         self._build_window()
+        self._build_statusbar()
         self._start_timers()
         return self
+
+    @objc.python_method
+    def _build_statusbar(self):
+        # иконка в строке меню — чтобы управлять, даже когда оверлей скрыт
+        item = NSStatusBar.systemStatusBar().statusItemWithLength_(
+            NSVariableStatusItemLength
+        )
+        item.button().setTitle_("▦")
+        item.button().setToolTip_("sysmon")
+        menu = NSMenu.alloc().init()
+
+        def add(title, sel):
+            m = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(title, sel, "")
+            m.setTarget_(self)
+            menu.addItem_(m)
+
+        add("Показать / скрыть оверлей", b"toggleOverlay:")
+        add("Настройки…", b"openSettings:")
+        menu.addItem_(NSMenuItem.separatorItem())
+        add("Выход", b"quit:")
+        item.setMenu_(menu)
+        self.status_item = item
+
+    def toggleOverlay_(self, sender):
+        if self.window.isVisible():
+            self.window.orderOut_(None)
+        else:
+            self.window.orderFront_(None)
 
     # ----------------------------------------------------------------- окно
     @objc.python_method
@@ -227,6 +261,9 @@ class Monitor(NSObject):
         self._last_fps_t = now
 
         data = self.engine.sample(self._fps)
+
+        for k in KEYS:
+            self.history[k].append(self.engine.values.get(k))
         blocks = []
         for key in self.cfg["metrics"]:
             chunk = data.get(key)
@@ -239,10 +276,8 @@ class Monitor(NSObject):
 
     @objc.python_method
     def _render(self):
-        if self.cfg.get("mode") == "board":
-            items = self._layout_board(self._last_blocks)
-        else:
-            items = self._layout_list(self._last_blocks)
+        # всегда мозаика; плитки двигаются только в редакторе, здесь — только показ
+        items = self._layout_board(self._last_blocks)
         self.view.setItems_(items)
 
     # ---------- геометрия плитки ----------
@@ -351,17 +386,9 @@ class Monitor(NSObject):
     # ---------- перетаскивание ----------
     @objc.python_method
     def onMouseDown_at_(self, px, py):
+        # на оверлее двигаем только всё окно; отдельные плитки — только в редакторе
         loc = NSEvent.mouseLocation()
-        key = None
-        if self.cfg.get("mode") == "board":
-            for it in reversed(self.view.items):
-                if it["x"] <= px <= it["x"] + it["w"] and it["y"] <= py <= it["y"] + it["h"]:
-                    key = it["key"]
-                    break
-        if key is not None:
-            self._drag = {"type": "tile", "key": key, "lx": loc.x, "ly": loc.y}
-        else:
-            self._drag = {"type": "win", "lx": loc.x, "ly": loc.y}
+        self._drag = {"type": "win", "lx": loc.x, "ly": loc.y}
 
     @objc.python_method
     def onMouseDragged(self):
@@ -437,17 +464,17 @@ class Monitor(NSObject):
             item.setTarget_(self)
             menu.addItem_(item)
 
-        if self.cfg.get("mode") == "board":
-            add("Режим: Мозаика ✓  →  Список", b"toggleMode:")
-        else:
-            add("Режим: Список ✓  →  Мозаика", b"toggleMode:")
-        menu.addItem_(NSMenuItem.separatorItem())
         add("Настройки…", b"openSettings:")
-        add("Прозрачнее", b"lessOpaque:")
-        add("Плотнее", b"moreOpaque:")
-        menu.addItem_(NSMenuItem.separatorItem())
-        add("Выход", b"quit:")
+        add("Скрыть", b"hideOverlay:")
         NSMenu.popUpContextMenu_withEvent_forView_(menu, event, self.view)
+
+    def hideOverlay_(self, sender):
+        # просто прячем оверлей; вернуть можно через иконку в строке меню (▦)
+        self.window.orderOut_(None)
+
+    @objc.python_method
+    def show_overlay(self):
+        self.window.orderFront_(None)
 
     def toggleMode_(self, sender):
         self.cfg["mode"] = "list" if self.cfg.get("mode") == "board" else "board"
@@ -475,119 +502,9 @@ class Monitor(NSObject):
 
     # ------------------------------------------------------------ настройки
     def openSettings_(self, sender):
-        if self._settings_win is None:
-            win = NSWindow.alloc().initWithContentRect_styleMask_backing_defer_(
-                NSMakeRect(0, 0, 380, 100),
-                NSWindowStyleMaskTitled | NSWindowStyleMaskClosable,
-                NSBackingStoreBuffered,
-                False,
-            )
-            win.setTitle_("Настройки sysmon")
-            win.setReleasedWhenClosed_(False)
-            win.setLevel_(NSScreenSaverWindowLevel)
-            self._settings_win = win
-        self._rebuild_settings_view()
-        self._settings_win.center()
-        NSApp().activateIgnoringOtherApps_(True)
-        self._settings_win.makeKeyAndOrderFront_(None)
-
-    @objc.python_method
-    def _ordered_keys(self):
-        enabled = list(self.cfg["metrics"])
-        return enabled + [k for k in KEYS if k not in enabled]
-
-    @objc.python_method
-    def _rebuild_settings_view(self):
-        win = self._settings_win
-        row_h, top, bottom, width = 30, 50, 16, 380
-        keys = self._ordered_keys()
-        height = top + len(keys) * row_h + bottom
-
-        win.setFrame_display_(
-            NSMakeRect(win.frame().origin.x, win.frame().origin.y, width, height + 22),
-            True,
-        )
-        content = NSView.alloc().initWithFrame_(NSMakeRect(0, 0, width, height))
-        content.setFlipped_(True)
-        win.setContentView_(content)
-
-        header = NSTextField.alloc().initWithFrame_(NSMakeRect(16, 12, width - 32, 22))
-        header.setStringValue_("Галочка — показывать.  ▲▼ — порядок.")
-        header.setBezeled_(False)
-        header.setDrawsBackground_(False)
-        header.setEditable_(False)
-        header.setSelectable_(False)
-        content.addSubview_(header)
-
-        enabled = self.cfg["metrics"]
-        for i, key in enumerate(keys):
-            y = top + i * row_h
-            tag = KEYS.index(key)
-
-            swatch = NSView.alloc().initWithFrame_(NSMakeRect(16, y + 6, 14, 14))
-            swatch.setWantsLayer_(True)
-            swatch.layer().setBackgroundColor_(
-                ns_color(self.cfg["colors"].get(key, "#FFFFFF")).CGColor()
-            )
-            swatch.layer().setCornerRadius_(3.0)
-            content.addSubview_(swatch)
-
-            cb = NSButton.alloc().initWithFrame_(NSMakeRect(40, y + 3, 234, 22))
-            cb.setButtonType_(NSButtonTypeSwitch)
-            cb.setTitle_(LABELS[key])
-            cb.setState_(1 if key in enabled else 0)
-            cb.setTarget_(self)
-            cb.setAction_(b"toggleMetric:")
-            cb.setTag_(tag)
-            content.addSubview_(cb)
-
-            up = NSButton.alloc().initWithFrame_(NSMakeRect(282, y + 2, 44, 24))
-            up.setTitle_("▲")
-            up.setBezelStyle_(1)
-            up.setTarget_(self)
-            up.setAction_(b"moveUp:")
-            up.setTag_(tag)
-            up.setEnabled_(key in enabled)
-            content.addSubview_(up)
-
-            down = NSButton.alloc().initWithFrame_(NSMakeRect(328, y + 2, 44, 24))
-            down.setTitle_("▼")
-            down.setBezelStyle_(1)
-            down.setTarget_(self)
-            down.setAction_(b"moveDown:")
-            down.setTag_(tag)
-            down.setEnabled_(key in enabled)
-            content.addSubview_(down)
-
-    def toggleMetric_(self, sender):
-        key = KEYS[sender.tag()]
-        metrics = self.cfg["metrics"]
-        if key in metrics:
-            metrics.remove(key)
-        else:
-            metrics.append(key)
-        save_config(self.cfg)
-        self._rebuild_settings_view()
-        self._render()
-
-    def moveUp_(self, sender):
-        self._move(KEYS[sender.tag()], -1)
-
-    def moveDown_(self, sender):
-        self._move(KEYS[sender.tag()], +1)
-
-    @objc.python_method
-    def _move(self, key, delta):
-        metrics = self.cfg["metrics"]
-        if key not in metrics:
-            return
-        i = metrics.index(key)
-        j = i + delta
-        if 0 <= j < len(metrics):
-            metrics[i], metrics[j] = metrics[j], metrics[i]
-            save_config(self.cfg)
-            self._rebuild_settings_view()
-            self._render()
+        if self._editor is None:
+            self._editor = Editor.alloc().initWithMonitor_(self)
+        self._editor.open()
 
 
 def main():

@@ -22,12 +22,15 @@ ROOT_PATH = "/" if os.sep == "/" else "C:\\"
 AVAILABLE = [
     ("net", "Интернет (вниз/вверх)", "#34C759"),
     ("cpu", "Загрузка CPU", "#FF9F0A"),
-    ("ram", "Память RAM", "#0A84FF"),
+    ("cpufreq", "Частота CPU", "#F472B6"),
+    ("ram", "Память RAM (%)", "#0A84FF"),
+    ("memused", "Память RAM (ГБ)", "#22D3EE"),
     ("swap", "Подкачка (swap)", "#BF5AF2"),
     ("disk", "Диск — занято %", "#5AC8FA"),
+    ("diskfree", "Диск — свободно", "#A3E635"),
     ("diskio", "Диск — чтение/запись", "#7A78FF"),
     ("battery", "Батарея", "#30D158"),
-    ("fps", "FPS / частота экрана", "#FF375F"),
+    ("fps", "FPS окна / частота экрана", "#FF375F"),
     ("loadavg", "Load average", "#FF6482"),
     ("procs", "Число процессов", "#64D2FF"),
     ("uptime", "Время работы", "#66D4CF"),
@@ -36,6 +39,25 @@ AVAILABLE = [
 KEYS = [k for k, _, _ in AVAILABLE]
 LABELS = {k: lbl for k, lbl, _ in AVAILABLE}
 DEFAULT_COLORS = {k: c for k, _, c in AVAILABLE}
+
+# Описания метрик — для палитры (подсказка при наведении) и инспектора.
+DESCRIPTIONS = {
+    "net": "Скорость интернета: вниз — загрузка, вверх — отдача.",
+    "cpu": "Насколько загружен процессор, в процентах.",
+    "cpufreq": "Текущая тактовая частота процессора.",
+    "ram": "Сколько оперативной памяти занято, в процентах.",
+    "memused": "Сколько оперативной памяти занято, в гигабайтах.",
+    "swap": "Файл подкачки: сколько данных ОС выгрузила из памяти на диск.",
+    "disk": "Сколько занято на системном диске, в процентах.",
+    "diskfree": "Сколько свободного места на системном диске.",
+    "diskio": "Скорость чтения и записи диска.",
+    "battery": "Заряд батареи; «+» означает, что идёт зарядка.",
+    "fps": "Частота, с которой рисуется окно/экран (Гц) — обычно 60 или 120.",
+    "loadavg": "Средняя нагрузка на систему за 1 минуту (только macOS/Linux).",
+    "procs": "Сколько сейчас запущено процессов.",
+    "uptime": "Сколько система работает без выключения.",
+    "clock": "Текущее время.",
+}
 
 DEFAULT_METRICS = ["net", "cpu", "fps"]
 
@@ -151,12 +173,15 @@ class MetricsEngine:
         self.last_dio = psutil.disk_io_counters()
         self.last_t = time.monotonic()
         psutil.cpu_percent(interval=None)
+        # числовые значения последней выборки — для графиков (None = не строится)
+        self.values = {k: None for k in KEYS}
 
     def sample(self, fps):
-        """Возвращает {ключ: [строки] | None} для всех метрик."""
+        """Возвращает {ключ: [строки] | None}. Числа кладёт в self.values."""
         now = time.monotonic()
         dt = max(now - self.last_t, 1e-6)
         out = {}
+        vals = {k: None for k in KEYS}
 
         try:
             net = psutil.net_io_counters()
@@ -164,15 +189,41 @@ class MetricsEngine:
             up = (net.bytes_sent - self.last_net.bytes_sent) / dt
             self.last_net = net
             out["net"] = [f"NET  v {human_speed(down)}", f"     ^ {human_speed(up)}"]
+            vals["net"] = down
         except Exception:
             out["net"] = None
 
-        out["cpu"] = [f"CPU  {psutil.cpu_percent(interval=None):.0f}%"]
-        out["ram"] = [f"RAM  {psutil.virtual_memory().percent:.0f}%"]
+        cpu = psutil.cpu_percent(interval=None)
+        out["cpu"] = [f"CPU  {cpu:.0f}%"]
+        vals["cpu"] = cpu
+
+        try:
+            fr = psutil.cpu_freq()
+            if fr and fr.current:
+                if fr.current >= 1000:
+                    out["cpufreq"] = [f"FRQ  {fr.current / 1000:.2f} GHz"]
+                else:
+                    out["cpufreq"] = [f"FRQ  {fr.current:.0f} MHz"]
+                vals["cpufreq"] = fr.current
+            else:
+                out["cpufreq"] = None
+        except Exception:
+            out["cpufreq"] = None
+
+        vm = psutil.virtual_memory()
+        out["ram"] = [f"RAM  {vm.percent:.0f}%"]
+        vals["ram"] = vm.percent
+        out["memused"] = [f"MEM  {human_bytes(vm.used)}"]
+        vals["memused"] = float(vm.used)
 
         sw = psutil.swap_memory()
         out["swap"] = [f"SWAP {human_bytes(sw.used)} ({sw.percent:.0f}%)"]
-        out["disk"] = [f"DISK {psutil.disk_usage(ROOT_PATH).percent:.0f}%"]
+        vals["swap"] = sw.percent
+        du = psutil.disk_usage(ROOT_PATH)
+        out["disk"] = [f"DISK {du.percent:.0f}%"]
+        vals["disk"] = du.percent
+        out["diskfree"] = [f"FREE {human_bytes(du.free)}"]
+        vals["diskfree"] = float(du.free)
 
         try:
             dio = psutil.disk_io_counters()
@@ -180,29 +231,36 @@ class MetricsEngine:
             w = (dio.write_bytes - self.last_dio.write_bytes) / dt
             self.last_dio = dio
             out["diskio"] = [f"IO   R {human_bytes(r)}/s W {human_bytes(w)}/s"]
+            vals["diskio"] = r
         except Exception:
             out["diskio"] = None
 
         try:
             bat = psutil.sensors_battery()
-            out["battery"] = (
-                None
-                if bat is None
-                else [f"BAT  {bat.percent:.0f}%{' +' if bat.power_plugged else ''}"]
-            )
+            if bat is None:
+                out["battery"] = None
+            else:
+                out["battery"] = [f"BAT  {bat.percent:.0f}%{' +' if bat.power_plugged else ''}"]
+                vals["battery"] = bat.percent
         except Exception:
             out["battery"] = None
 
         out["fps"] = [f"FPS  {fps:.0f}"]
+        vals["fps"] = fps
 
         try:
-            out["loadavg"] = [f"LOAD {os.getloadavg()[0]:.2f}"]
+            la = os.getloadavg()[0]
+            out["loadavg"] = [f"LOAD {la:.2f}"]
+            vals["loadavg"] = la
         except (OSError, AttributeError):
             out["loadavg"] = None  # на Windows load average нет
 
-        out["procs"] = [f"PROC {len(psutil.pids())}"]
+        n = len(psutil.pids())
+        out["procs"] = [f"PROC {n}"]
+        vals["procs"] = float(n)
         out["uptime"] = [f"UP   {human_uptime(time.time() - psutil.boot_time())}"]
         out["clock"] = [f"TIME {time.strftime('%H:%M')}"]
 
+        self.values = vals
         self.last_t = now
         return out
