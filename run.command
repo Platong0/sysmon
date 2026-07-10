@@ -1,4 +1,4 @@
 #!/bin/bash
-# Двойной клик по этому файлу запускает оверлей.
+# Двойной клик по этому файлу запускает оверлей (из исходников).
 cd "$(dirname "$0")" || exit 1
-exec ./.venv/bin/python monitor.py
+PYTHONPATH=src exec ./.venv/bin/python -m sysmon_overlay

@@ -57,7 +57,7 @@ from Foundation import (
     NSTimer,
 )
 
-from metrics import (
+from .metrics import (
     KEYS,
     LABELS,
     MetricsEngine,
@@ -65,7 +65,7 @@ from metrics import (
     load_config,
     save_config,
 )
-from editor_mac import Editor
+from .editor_mac import Editor
 
 
 def ns_color(hexstr, alpha=1.0):

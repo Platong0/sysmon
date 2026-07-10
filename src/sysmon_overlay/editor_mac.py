@@ -45,7 +45,7 @@ from AppKit import (
 )
 from Foundation import NSMakePoint, NSMakeSize, NSObject, NSString, NSTimer
 
-from metrics import DESCRIPTIONS, KEYS, LABELS, hex_to_rgb, human_bytes, save_config
+from .metrics import DESCRIPTIONS, KEYS, LABELS, hex_to_rgb, human_bytes, save_config
 
 
 def _fmt_val(v):

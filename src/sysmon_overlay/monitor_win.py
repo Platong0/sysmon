@@ -15,7 +15,7 @@ import platform
 import tkinter as tk
 import tkinter.font as tkfont
 
-from metrics import (
+from .metrics import (
     KEYS,
     LABELS,
     MetricsEngine,

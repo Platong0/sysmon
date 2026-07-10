@@ -12,7 +12,11 @@ import time
 
 import psutil
 
-CONFIG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.json")
+# Конфиг храним в пользовательской папке (чтобы установленный пакет не писал
+# в site-packages). Можно переопределить переменной окружения SYSMON_CONFIG.
+_cfg_home = os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config")
+CONFIG_DIR = os.path.join(_cfg_home, "sysmon-overlay")
+CONFIG_PATH = os.environ.get("SYSMON_CONFIG") or os.path.join(CONFIG_DIR, "config.json")
 
 # Корень диска для disk_usage: '/' на macOS/Linux, 'C:\' на Windows.
 ROOT_PATH = "/" if os.sep == "/" else "C:\\"
@@ -124,6 +128,7 @@ def save_config(cfg):
         "layout": cfg.get("layout", {}),
     }
     try:
+        os.makedirs(os.path.dirname(CONFIG_PATH), exist_ok=True)
         with open(CONFIG_PATH, "w", encoding="utf-8") as f:
             json.dump(out, f, indent=2, ensure_ascii=False)
     except OSError:

@@ -1,0 +1,39 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "sysmon-overlay"
+version = "2.26.0"
+description = "Плавающий настраиваемый системный монитор-оверлей для macOS и Windows"
+readme = "README.md"
+requires-python = ">=3.9"
+license = { file = "LICENSE" }
+authors = [{ name = "Platong0" }]
+keywords = ["system-monitor", "overlay", "hud", "fps", "cpu", "macos", "windows"]
+classifiers = [
+    "Environment :: MacOS X",
+    "Environment :: Win32 (MS Windows)",
+    "Intended Audience :: End Users/Desktop",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: MacOS",
+    "Operating System :: Microsoft :: Windows",
+    "Programming Language :: Python :: 3",
+    "Topic :: System :: Monitoring",
+]
+dependencies = [
+    "psutil",
+    "pyobjc-framework-Cocoa; sys_platform == 'darwin'",
+    "pyobjc-framework-Quartz; sys_platform == 'darwin'",
+]
+
+[project.urls]
+Homepage = "https://github.com/Platong0/sysmon"
+Source = "https://github.com/Platong0/sysmon"
+
+[project.scripts]
+sysmon = "sysmon_overlay.cli:main"
+sysmon-overlay = "sysmon_overlay.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/sysmon_overlay"]
